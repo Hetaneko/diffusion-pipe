@@ -93,7 +93,7 @@ class PreprocessMediaFile:
         for tar_f in self.tarfile_map.values():
             tar_f.close()
 
-    def __call__(self, spec, mask_filepath, size_bucket=None):
+    def __call__(self, spec, mask_filepath, size_bucket=None, preserve_aspect_ratio=False):
         is_video = (Path(spec[1]).suffix in VIDEO_EXTENSIONS)
 
         if spec[0] is None:
@@ -119,13 +119,19 @@ class PreprocessMediaFile:
             height, width = pil_img.height, pil_img.width
             video = [pil_img]
 
-        if size_bucket is not None:
+        if preserve_aspect_ratio:
+            size_bucket_width, size_bucket_height, size_bucket_frames = width, height, num_frames
+        elif size_bucket is not None:
             size_bucket_width, size_bucket_height, size_bucket_frames = size_bucket
         else:
             size_bucket_width, size_bucket_height, size_bucket_frames = width, height, num_frames
 
-        height_rounded = round_to_nearest_multiple(size_bucket_height, self.round_height)
-        width_rounded = round_to_nearest_multiple(size_bucket_width, self.round_width)
+        if preserve_aspect_ratio:
+            height_rounded = size_bucket_height
+            width_rounded = size_bucket_width
+        else:
+            height_rounded = round_to_nearest_multiple(size_bucket_height, self.round_height)
+            width_rounded = round_to_nearest_multiple(size_bucket_width, self.round_width)
         frames_rounded = round_down_to_multiple(size_bucket_frames - 1, self.round_frames) + 1
         resize_wh = (width_rounded, height_rounded)
 
@@ -148,8 +154,11 @@ class PreprocessMediaFile:
         for i, frame in enumerate(video):
             if not isinstance(frame, Image.Image):
                 frame = torchvision.transforms.functional.to_pil_image(frame)
-            cropped_image = convert_crop_and_resize(frame, resize_wh)
-            resized_video[i, ...] = self.pil_to_tensor(cropped_image)
+            if preserve_aspect_ratio:
+                image = convert_crop_and_resize(frame, (width, height))
+            else:
+                image = convert_crop_and_resize(frame, resize_wh)
+            resized_video[i, ...] = self.pil_to_tensor(image)
 
         if hasattr(filepath_or_file, 'close'):
             filepath_or_file.close()

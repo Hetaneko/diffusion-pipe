@@ -1099,14 +1099,16 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
                 control_files = control_file if isinstance(control_file, list) else [control_file]
                 control_tensors = []
                 for file in control_files:
-                    control_items = preprocess_media_file_fn((None, file), None, size_bucket)
+                    control_items = preprocess_media_file_fn((None, file), None, None, preserve_aspect_ratio=True)
                     assert len(control_items) == 1
                     control_tensors.append(control_items[0][0])
                 assert len(items) == 1
                 if len(control_tensors) == 1:
                     control_tensors_and_masks.append(control_tensors[0])
-                else:
+                elif all(t.shape == control_tensors[0].shape for t in control_tensors):
                     control_tensors_and_masks.append(torch.stack(control_tensors))
+                else:
+                    control_tensors_and_masks.append(control_tensors)
             else:
                 control_tensors_and_masks.append(None)
 
@@ -1118,7 +1120,14 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         results = defaultdict(list)
         for i in range(0, len(tensors_and_masks), caching_batch_size):
             tensor = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
-            c_tensor = torch.stack(control_tensors_and_masks[i:i+caching_batch_size]) if is_edit_dataset else None
+            c_tensor = None
+            if is_edit_dataset:
+                c_tensors = control_tensors_and_masks[i:i+caching_batch_size]
+                first = c_tensors[0]
+                if all(torch.is_tensor(t) and t.shape == first.shape for t in c_tensors):
+                    c_tensor = torch.stack(c_tensors)
+                else:
+                    c_tensor = c_tensors
             if rank not in pipes:
                 pipes[rank] = mp.Pipe(duplex=False)
             parent_conn, child_conn = pipes[rank]
@@ -1126,9 +1135,16 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
             result = parent_conn.recv()  # dict
             for k, v in result.items():
                 results[k].append(v)
-        # concatenate the list of tensors at each key into one batched tensor
+        # concatenate the list of tensors at each key into one batched tensor when possible;
+        # ragged control latents stay as per-example lists.
         for k, v in results.items():
-            results[k] = torch.cat(v)
+            if all(torch.is_tensor(item) for item in v):
+                results[k] = torch.cat(v)
+            else:
+                flattened = []
+                for item in v:
+                    flattened.extend(item if isinstance(item, list) else [item])
+                results[k] = flattened
         results['image_spec'] = image_specs
         results['mask'] = [t[1] for t in tensors_and_masks]
         results['caption'] = captions
@@ -1273,12 +1289,14 @@ class DatasetManager:
         # Need to move to CPU here. If we don't, we get this error:
         # RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use the 'spawn' start method
         # I think this is because HF Datasets uses the multiprocess library (different from Python multiprocessing!) so it will always use fork.
-        cpu_results = {}
-        for k, v in results.items():
-            if isinstance(v, (list, tuple)):
-                cpu_results[k] = [x.to('cpu') for x in v]
-            else:
-                cpu_results[k] = v.to('cpu')
+        def to_cpu(obj):
+            if torch.is_tensor(obj):
+                return obj.to('cpu')
+            if isinstance(obj, (list, tuple)):
+                return [to_cpu(x) for x in obj]
+            return obj
+
+        cpu_results = {k: to_cpu(v) for k, v in results.items()}
         pipe.send(cpu_results)
 
 

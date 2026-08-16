@@ -337,18 +337,37 @@ class CosmosPredict2Pipeline(BasePipeline):
             latents = vae_encode(tensor, self.vae)
             result = {'latents': latents}
             if control_tensor is not None:
-                control_tensor = control_tensor.to(p.device, p.dtype)
-                if control_tensor.ndim == 6:
-                    # Multi-control: [B, num_controls, C, T, H, W] — flatten, encode, unflatten
-                    bs, num_controls = control_tensor.shape[:2]
-                    control_tensor = control_tensor.flatten(0, 1)  # [B*num_controls, C, T, H, W]
-                    control_latents = vae_encode(control_tensor, self.vae)
-                    control_latents = control_latents.unflatten(0, (bs, num_controls))  # [B, nC, C, T_latent, H_latent, W_latent]
+                if isinstance(control_tensor, (list, tuple)):
+                    control_latents = []
+                    for item in control_tensor:
+                        if isinstance(item, list):
+                            encoded_controls = []
+                            for control in item:
+                                control = control.to(p.device, p.dtype)
+                                encoded_controls.append(vae_encode(control.unsqueeze(0), self.vae).squeeze(0))
+                            control_latents.append(encoded_controls)
+                            continue
+                        item = item.to(p.device, p.dtype)
+                        if item.ndim == 5:
+                            # Multi-control item: [num_controls, C, T, H, W]
+                            encoded = vae_encode(item, self.vae)
+                        else:
+                            # Single control item: [C, T, H, W]
+                            encoded = vae_encode(item.unsqueeze(0), self.vae).squeeze(0)
+                        control_latents.append(encoded)
                 else:
-                    # Single control: already 5D [B, C, T, H, W] (or 4D [B, C, H, W])
-                    if control_tensor.ndim == 4:
-                        control_tensor = control_tensor.unsqueeze(2)
-                    control_latents = vae_encode(control_tensor, self.vae)
+                    control_tensor = control_tensor.to(p.device, p.dtype)
+                    if control_tensor.ndim == 6:
+                        # Multi-control: [B, num_controls, C, T, H, W] — flatten, encode, unflatten
+                        bs, num_controls = control_tensor.shape[:2]
+                        control_tensor = control_tensor.flatten(0, 1)  # [B*num_controls, C, T, H, W]
+                        control_latents = vae_encode(control_tensor, self.vae)
+                        control_latents = control_latents.unflatten(0, (bs, num_controls))  # [B, nC, C, T_latent, H_latent, W_latent]
+                    else:
+                        # Single control: already 5D [B, C, T, H, W] (or 4D [B, C, H, W])
+                        if control_tensor.ndim == 4:
+                            control_tensor = control_tensor.unsqueeze(2)
+                        control_latents = vae_encode(control_tensor, self.vae)
                 result['control_latents'] = control_latents
             return result
         return fn
@@ -421,7 +440,18 @@ class CosmosPredict2Pipeline(BasePipeline):
 
         # Handle control latents for edit / multi-control datasets
         if 'control_latents' in inputs:
-            control_latents = inputs['control_latents'].float()
+            control_latents = inputs['control_latents']
+            if isinstance(control_latents, list):
+                if bs != 1:
+                    raise ValueError('Anima Edit control images with different latent shapes require micro_batch_size_per_gpu=1.')
+                control_latents = control_latents[0]
+                if isinstance(control_latents, list):
+                    if not all(t.shape[-2:] == control_latents[0].shape[-2:] for t in control_latents):
+                        raise ValueError('Multiple Anima Edit control images for one sample must share latent spatial dimensions.')
+                    control_latents = torch.stack(control_latents)
+                control_latents = control_latents.float().to(noisy_latents.device)
+            else:
+                control_latents = control_latents.float()
             # Original target temporal dimension (for cropping model output)
             # Shape: [B] so it survives split_batch which requires >= 1-D tensors
             target_t = torch.full((bs,), noisy_latents.shape[2], dtype=torch.long, device=noisy_latents.device)
