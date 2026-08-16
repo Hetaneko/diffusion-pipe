@@ -1041,6 +1041,41 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if x_B_T_H_W_D.ndim == 3:
+            if extra_per_block_pos_emb is not None:
+                x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
+
+            if self.use_adaln_lora:
+                shift_self_attn, scale_self_attn, gate_self_attn = (
+                    self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
+                ).chunk(3, dim=-1)
+                shift_cross_attn, scale_cross_attn, gate_cross_attn = (
+                    self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
+                ).chunk(3, dim=-1)
+                shift_mlp, scale_mlp, gate_mlp = (
+                    self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
+                ).chunk(3, dim=-1)
+            else:
+                shift_self_attn, scale_self_attn, gate_self_attn = self.adaln_modulation_self_attn(emb_B_T_D).chunk(3, dim=-1)
+                shift_cross_attn, scale_cross_attn, gate_cross_attn = self.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
+                shift_mlp, scale_mlp, gate_mlp = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+
+            def _flat_fn(x, norm_layer, scale, shift):
+                return norm_layer(x) * (1 + scale) + shift
+
+            normalized_x = _flat_fn(x_B_T_H_W_D, self.layer_norm_self_attn, scale_self_attn, shift_self_attn)
+            result = self.self_attn(normalized_x, None, rope_emb=rope_emb_L_1_1_D)
+            x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn * result
+
+            normalized_x = _flat_fn(x_B_T_H_W_D, self.layer_norm_cross_attn, scale_cross_attn, shift_cross_attn)
+            result = self.cross_attn(normalized_x, crossattn_emb, rope_emb=rope_emb_L_1_1_D)
+            x_B_T_H_W_D = x_B_T_H_W_D + gate_cross_attn * result
+
+            normalized_x = _flat_fn(x_B_T_H_W_D, self.layer_norm_mlp, scale_mlp, shift_mlp)
+            result = self.mlp(normalized_x)
+            x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp * result
+            return x_B_T_H_W_D
+
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 

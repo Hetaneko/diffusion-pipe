@@ -1301,12 +1301,35 @@ class DatasetManager:
 
 
 def split_batch(batch, pieces):
-    # Each of features, label is a tuple of tensors.
+    # Each of features, label is a tuple of tensors, except ragged model inputs which
+    # may be represented as lists of per-example tensors.
     features, label = batch
-    split_size = features[0].size(0) // pieces
-    # The tuples passed to Deepspeed need to only contain tensors. For None (e.g. mask, or optional conditioning), convert to empty tensor.
-    split_features = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in features))
-    split_label = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in label))
+
+    def get_batch_size(item):
+        if torch.is_tensor(item):
+            return item.size(0)
+        if isinstance(item, list):
+            return get_batch_size(item[0])
+        raise TypeError(f'Unsupported batch item type: {type(item)}')
+
+    def split_item(item, split_size):
+        if item is None:
+            return [torch.tensor([])] * pieces
+        if torch.is_tensor(item):
+            return torch.split(item, split_size)
+        if isinstance(item, list):
+            # Ragged lists are only used for Anima Edit samples that cannot be
+            # represented as one dense tensor. Preserve the list for a single
+            # microbatch; otherwise split each nested tensor along batch dim.
+            if pieces == 1:
+                return [item]
+            nested = [split_item(x, split_size) for x in item]
+            return [[parts[i] for parts in nested] for i in range(pieces)]
+        raise TypeError(f'Unsupported batch item type: {type(item)}')
+
+    split_size = get_batch_size(features[0]) // pieces
+    split_features = zip(*(split_item(item, split_size) for item in features))
+    split_label = zip(*(split_item(item, split_size) for item in label))
     # Deepspeed works with a tuple of (features, labels).
     return list(zip(split_features, split_label))
 

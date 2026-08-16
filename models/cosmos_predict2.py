@@ -446,9 +446,10 @@ class CosmosPredict2Pipeline(BasePipeline):
                     raise ValueError('Anima Edit control images with different latent shapes require micro_batch_size_per_gpu=1.')
                 control_latents = control_latents[0]
                 if isinstance(control_latents, list):
-                    if not all(t.shape[-2:] == control_latents[0].shape[-2:] for t in control_latents):
-                        raise ValueError('Multiple Anima Edit control images for one sample must share latent spatial dimensions.')
-                    control_latents = torch.stack(control_latents)
+                    control_latents = [t.float().to(noisy_latents.device) for t in control_latents]
+                    noisy_latents = [noisy_latents, *[t.unsqueeze(0) for t in control_latents]]
+                    target_t = torch.tensor([[target.shape[2], target.shape[3], target.shape[4]]], dtype=torch.long, device=target.device)
+                    return (noisy_latents, t, *prompt_embeds_or_batch_encoding, target_t), (target, mask)
                 control_latents = control_latents.float().to(noisy_latents.device)
             else:
                 control_latents = control_latents.float()
@@ -621,17 +622,37 @@ class InitialLayer(nn.Module):
                 input_ids, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
                 crossattn_emb = _compute_text_embeddings(self.text_encoder, input_ids, attn_mask, is_generic_llm=self.is_generic_llm)
 
-        padding_mask = torch.zeros(x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[3], x_B_C_T_H_W.shape[4], dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)
-        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.model[0].prepare_embedded_sequence(
-            x_B_C_T_H_W,
-            fps=None,
-            padding_mask=padding_mask,
-        )
-        assert extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is None
-        assert rope_emb_L_1_1_D is not None
+        if isinstance(x_B_C_T_H_W, list):
+            assert x_B_C_T_H_W[0].shape[0] == 1
+            flat_chunks = []
+            rope_chunks = []
+            for x in x_B_C_T_H_W:
+                padding_mask = torch.zeros(x.shape[0], 1, x.shape[3], x.shape[4], dtype=x.dtype, device=x.device)
+                x_chunk, rope_chunk, extra_pos_emb = self.model[0].prepare_embedded_sequence(
+                    x,
+                    fps=None,
+                    padding_mask=padding_mask,
+                )
+                assert extra_pos_emb is None
+                assert rope_chunk is not None
+                flat_chunks.append(x_chunk.flatten(1, 3))
+                rope_chunks.append(rope_chunk)
+            x_B_T_H_W_D = torch.cat(flat_chunks, dim=1)
+            rope_emb_L_1_1_D = torch.cat(rope_chunks, dim=0)
+            extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = None
+            timesteps_B_T = timesteps_B_T.reshape(1, 1).expand(1, x_B_T_H_W_D.shape[1])
+        else:
+            padding_mask = torch.zeros(x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[3], x_B_C_T_H_W.shape[4], dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)
+            x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.model[0].prepare_embedded_sequence(
+                x_B_C_T_H_W,
+                fps=None,
+                padding_mask=padding_mask,
+            )
+            assert extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is None
+            assert rope_emb_L_1_1_D is not None
 
-        if timesteps_B_T.ndim == 1:
-            timesteps_B_T = timesteps_B_T.unsqueeze(1)
+            if timesteps_B_T.ndim == 1:
+                timesteps_B_T = timesteps_B_T.unsqueeze(1)
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
@@ -694,8 +715,11 @@ class FinalLayer(nn.Module):
     def forward(self, inputs):
         x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T, target_t = inputs
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
-        # Crop output to original target temporal dimension if control latents were used
-        if target_t[0].item() > 0:
+        # Crop output to original target temporal/spatial dimensions if control latents were used.
+        if target_t.ndim == 2:
+            t, h, w = target_t[0].tolist()
+            x_B_T_H_W_O = x_B_T_H_W_O[:, :t * h * w, :].reshape(1, t, h, w, -1)
+        elif target_t[0].item() > 0:
             x_B_T_H_W_O = x_B_T_H_W_O[:, :target_t[0].item(), :, :]
         net_output_B_C_T_H_W = self.unpatchify(x_B_T_H_W_O)
         return net_output_B_C_T_H_W
