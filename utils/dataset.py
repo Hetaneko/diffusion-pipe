@@ -36,6 +36,35 @@ ROUND_DECIMAL_DIGITS = 3
 
 UNCOND_FRACTION = 0.0
 
+CONTROL_DROPOUT_MODES = [
+    (("ref1", "ref2", "ref3"), 70),
+    (("ref2", "ref3"),         10),
+    (("ref1", "ref2"),          7),
+    (("ref1", "ref3"),          6),
+    (("ref1",),                 3),
+    (("ref2",),                 3),
+    (("ref3",),                 1),
+]
+CONTROL_DROPOUT_SLOT_NAMES = tuple(f"ref{i + 1}" for i in range(3))
+
+
+def select_control_dropout_mode(rng=random):
+    """Select one batch-level active reference slot tuple by weighted random draw."""
+    total_weight = sum(weight for _, weight in CONTROL_DROPOUT_MODES)
+    if total_weight <= 0:
+        raise ValueError('CONTROL_DROPOUT_MODES must contain positive total weight')
+    draw = rng.uniform(0, total_weight)
+    cumulative = 0
+    for mode, weight in CONTROL_DROPOUT_MODES:
+        cumulative += weight
+        if draw < cumulative:
+            return mode
+    return CONTROL_DROPOUT_MODES[-1][0]
+
+
+def _slot_name(index):
+    return CONTROL_DROPOUT_SLOT_NAMES[index] if index < len(CONTROL_DROPOUT_SLOT_NAMES) else f"ref{index + 1}"
+
 
 def shuffle_with_seed(l, seed=None):
     rng_state = random.getstate()
@@ -310,6 +339,13 @@ class SizeBucketDataset:
         entry = self.iteration_order[idx]
 
         ret = self.latent_dataset[entry['latents_idx']]
+        if 'control_latents' in ret and torch.is_tensor(ret['control_latents']) and ret['control_latents'].ndim == 5:
+            # Backward-compatible normalization for older multi-control caches that stored
+            # [num_controls, C, T, H, W]. The collator consumes independent slots by name.
+            ret['control_latents'] = {
+                _slot_name(slot_idx): ret['control_latents'][slot_idx].clone()
+                for slot_idx in range(ret['control_latents'].shape[0])
+            }
 
         use_uncond = UNCOND_FRACTION > 0 and random.random() < UNCOND_FRACTION
         if use_uncond:
@@ -1022,11 +1058,31 @@ class Dataset:
     # Each feature can be a tensor, list, or single item.
     def _collate(self, examples):
         ret = {}
+        active_control_refs = None
+        if 'control_latents' in examples[0] and isinstance(examples[0]['control_latents'], dict):
+            active_control_refs = select_control_dropout_mode()
         for key in examples[0]:
             if key == 'mask':
                 continue  # mask is handled specially below
             features = [example[key] for example in examples]
-            if torch.is_tensor(features[0]):
+            if key == 'control_latents' and isinstance(features[0], dict):
+                available_refs = set(features[0])
+                missing_refs = [ref for ref in active_control_refs if ref not in available_refs]
+                if missing_refs:
+                    raise RuntimeError(
+                        f"Selected control references {missing_refs} are not available in cached control_latents; "
+                        f"available references: {sorted(available_refs)}"
+                    )
+                per_ref_batches = []
+                for ref in active_control_refs:
+                    ref_features = [feature[ref] for feature in features]
+                    shape = ref_features[0].shape
+                    if not all(f.shape == shape for f in ref_features):
+                        raise RuntimeError(f"All control latents for {ref} must have the same shape within a batch")
+                    per_ref_batches.append(torch.stack(ref_features))
+                features = torch.stack(per_ref_batches, dim=1)
+                ret['active_control_refs'] = active_control_refs
+            elif torch.is_tensor(features[0]):
                 shape = features[0].shape
                 if all(f.shape == shape for f in features):
                     # if we can form a single batched tensor, do it
@@ -1124,11 +1180,23 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
             parent_conn, child_conn = pipes[rank]
             queue.put((0, tensor, c_tensor, child_conn))
             result = parent_conn.recv()  # dict
+            control_latents = result.get('control_latents')
+            if control_latents is not None and control_latents.ndim == 6:
+                result['control_latents'] = {
+                    _slot_name(slot_idx): control_latents[:, slot_idx].clone()
+                    for slot_idx in range(control_latents.shape[1])
+                }
             for k, v in result.items():
                 results[k].append(v)
         # concatenate the list of tensors at each key into one batched tensor
         for k, v in results.items():
-            results[k] = torch.cat(v)
+            if k == 'control_latents' and isinstance(v[0], dict):
+                results[k] = {
+                    slot: torch.cat([item[slot] for item in v])
+                    for slot in v[0]
+                }
+            else:
+                results[k] = torch.cat(v)
         results['image_spec'] = image_specs
         results['mask'] = [t[1] for t in tensors_and_masks]
         results['caption'] = captions
