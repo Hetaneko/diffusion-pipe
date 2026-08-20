@@ -158,7 +158,11 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         for i in range(length):
             result = {}
             for key in batch:
-                result[key] = batch[key][i]
+              if isinstance(batch[key], dict):
+                  # Unbatch each tensor inside the dictionary
+                  result[key] = {sub_k: sub_v[i] for sub_k, sub_v in batch[key].items()}
+              else:
+                  result[key] = batch[key][i]
             yield recursive_clone_tensors(result)
 
     completed_batches = cache_size // caching_batch_size
@@ -1311,7 +1315,10 @@ class DatasetManager:
         # I think this is because HF Datasets uses the multiprocess library (different from Python multiprocessing!) so it will always use fork.
         cpu_results = {}
         for k, v in results.items():
-            if isinstance(v, (list, tuple)):
+            if isinstance(v, dict):
+                # Move each tensor inside the dictionary to CPU
+                cpu_results[k] = {ref_key: ref_tensor.to('cpu') for ref_key, ref_tensor in v.items()}
+            elif isinstance(v, (list, tuple)):
                 cpu_results[k] = [x.to('cpu') for x in v]
             else:
                 cpu_results[k] = v.to('cpu')
