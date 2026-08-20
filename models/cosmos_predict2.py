@@ -34,6 +34,18 @@ KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final
 MULTISCALE_LOSS_THRESHOLDS = [size * 0.9 for size in [1024]]
 MULTISCALE_LOSS_THRESHOLDS.sort()
 
+CONTROL_LATENT_TAGS = {
+    'ref1': 'layout_tag',
+    'ref2': 'character_tag',
+    'ref3': 'background_tag',
+}
+CONTROL_REF_IDS = {
+    'ref1': 1,
+    'ref2': 2,
+    'ref3': 3,
+}
+CONTROL_REF_NAMES = {v: k for k, v in CONTROL_REF_IDS.items()}
+
 
 def time_shift(mu: float, sigma: float, t: torch.Tensor):
     return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
@@ -300,6 +312,10 @@ class CosmosPredict2Pipeline(BasePipeline):
                 set_module_tensor_to_device(llm_adapter, name, device='cpu', dtype=dtype_to_use, value=llm_adapter_state_dict[name])
 
         self.transformer = transformer
+        hidden_dim = dit_config['model_channels']
+        self.transformer.layout_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.transformer.character_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.transformer.background_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
             p.original_name = name
@@ -344,6 +360,11 @@ class CosmosPredict2Pipeline(BasePipeline):
                     control_tensor = control_tensor.flatten(0, 1)  # [B*num_controls, C, T, H, W]
                     control_latents = vae_encode(control_tensor, self.vae)
                     control_latents = control_latents.unflatten(0, (bs, num_controls))  # [B, nC, C, T_latent, H_latent, W_latent]
+                    control_names = [f'ref{i + 1}' for i in range(num_controls)]
+                    control_latents = {
+                        name: control_latents[:, i]
+                        for i, name in enumerate(control_names)
+                    }
                 else:
                     # Single control: already 5D [B, C, T, H, W] (or 4D [B, C, H, W])
                     if control_tensor.ndim == 4:
@@ -352,6 +373,38 @@ class CosmosPredict2Pipeline(BasePipeline):
                 result['control_latents'] = control_latents
             return result
         return fn
+
+    def _prepare_active_control_latents(self, control_latents, active_control_refs):
+        if isinstance(control_latents, dict):
+            if active_control_refs is None:
+                active_control_refs = tuple(control_latents.keys())
+            missing_refs = [ref for ref in active_control_refs if ref not in control_latents]
+            if missing_refs:
+                raise RuntimeError(f'Active control refs {missing_refs} were requested but are missing from control_latents.')
+
+            active_refs = []
+            for ref in active_control_refs:
+                latent = control_latents[ref].float()
+                if latent.ndim == 4:
+                    latent = latent.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
+                elif latent.ndim == 5 and latent.shape[2] != 1:
+                    raise RuntimeError(f'Control latent {ref} must have temporal length 1, got shape {tuple(latent.shape)}')
+                active_refs.append((ref, latent))
+            return active_refs
+
+        control_latents = control_latents.float()
+        if control_latents.ndim == 6:
+            control_names = [f'ref{i + 1}' for i in range(control_latents.shape[1])]
+            if active_control_refs is None:
+                active_control_refs = tuple(control_names)
+            control_by_name = {
+                name: control_latents[:, i]
+                for i, name in enumerate(control_names)
+            }
+            return self._prepare_active_control_latents(control_by_name, active_control_refs)
+        if control_latents.ndim == 4:
+            control_latents = control_latents.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
+        return [(None, control_latents)]
 
     def get_call_text_encoder_fn(self, text_encoder):
         def fn(captions, is_video):
@@ -418,29 +471,30 @@ class CosmosPredict2Pipeline(BasePipeline):
         noisy_latents = (1 - t_expanded)*latents + t_expanded*noise
         target = noise - latents
         t = t.view(-1, 1)
+        active_control_refs = None
 
         # Handle control latents for edit / multi-control datasets
         if 'control_latents' in inputs:
-            control_latents = inputs['control_latents'].float()
+            control_latents = inputs['control_latents']
+            active_control_refs = inputs.get('active_control_refs', None)
             # Original target temporal dimension (for cropping model output)
             # Shape: [B] so it survives split_batch which requires >= 1-D tensors
             target_t = torch.full((bs,), noisy_latents.shape[2], dtype=torch.long, device=noisy_latents.device)
-            if control_latents.ndim == 6:
-                # Multi-control: [B, num_controls, C, T, H, W]
-                # Flatten controls into the temporal dimension: [B, C, num_controls, H, W]
-                num_controls = control_latents.shape[1]
-                # [B, nC, C, 1, H, W] -> [B, nC, C, H, W] (squeeze temporal=1)
-                control_latents = control_latents.squeeze(3)
-                # [B, nC, C, H, W] -> [B, C, nC, H, W]
-                control_latents = control_latents.permute(0, 2, 1, 3, 4)
-            elif control_latents.ndim == 4:
-                control_latents = control_latents.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
-            # else: already 5D [B, C, T, H, W], use as-is
-            noisy_latents = torch.cat([noisy_latents, control_latents], dim=2)
+            active_refs = self._prepare_active_control_latents(control_latents, active_control_refs)
+            noisy_latents = torch.cat([noisy_latents] + [latent for _, latent in active_refs], dim=2)
         else:
             target_t = torch.full((bs,), -1, dtype=torch.long, device=noisy_latents.device)
 
-        return (noisy_latents, t, *prompt_embeds_or_batch_encoding, target_t), (target, mask)
+        if active_control_refs is None:
+            active_control_ref_ids = torch.empty((bs, 0), dtype=torch.long, device=noisy_latents.device)
+        else:
+            active_control_ref_ids = torch.tensor(
+                [CONTROL_REF_IDS[ref] for ref in active_control_refs],
+                dtype=torch.long,
+                device=noisy_latents.device,
+            ).unsqueeze(0).expand(bs, -1)
+
+        return (noisy_latents, t, *prompt_embeds_or_batch_encoding, target_t, active_control_ref_ids), (target, mask)
 
     def to_layers(self):
         transformer = self.transformer
@@ -581,8 +635,9 @@ class InitialLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         x_B_C_T_H_W, timesteps_B_T, *rest = inputs
-        target_t = rest[-1]
-        prompt_embeds_or_batch_encoding = rest[:-1]
+        active_control_ref_ids = rest[-1]
+        target_t = rest[-2]
+        prompt_embeds_or_batch_encoding = rest[:-2]
 
         if torch.is_floating_point(prompt_embeds_or_batch_encoding[0]):
             crossattn_emb, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
@@ -604,6 +659,21 @@ class InitialLayer(nn.Module):
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
+        active_control_refs = [
+            CONTROL_REF_NAMES[ref_id]
+            for ref_id in active_control_ref_ids[0].tolist()
+        ]
+        if active_control_refs:
+            if len(active_control_refs) != x_B_T_H_W_D.shape[1] - target_t[0].item():
+                raise RuntimeError(
+                    f'Expected {x_B_T_H_W_D.shape[1] - target_t[0].item()} active controls, got {len(active_control_refs)}.'
+                )
+            for i, ref in enumerate(active_control_refs, start=target_t[0].item()):
+                tag_name = CONTROL_LATENT_TAGS.get(ref)
+                if tag_name is None:
+                    continue
+                tag = getattr(self.model[0], tag_name).to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
+                x_B_T_H_W_D[:, i] = x_B_T_H_W_D[:, i] + tag.view(1, 1, 1, -1)
 
         outputs =  make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T, target_t)
         for tensor in outputs:

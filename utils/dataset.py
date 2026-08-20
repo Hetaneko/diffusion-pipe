@@ -35,6 +35,15 @@ CAPTIONS_JSON_FILE = 'captions.json'
 ROUND_DECIMAL_DIGITS = 3
 
 UNCOND_FRACTION = 0.0
+CONTROL_DROPOUT_MODES = [
+    (("ref1", "ref2", "ref3"), 70),
+    (("ref2", "ref3"),         10),
+    (("ref1", "ref2"),          7),
+    (("ref1", "ref3"),          6),
+    (("ref1",),                 3),
+    (("ref2",),                 3),
+    (("ref3",),                 1),
+]
 
 
 def shuffle_with_seed(l, seed=None):
@@ -42,6 +51,11 @@ def shuffle_with_seed(l, seed=None):
     random.seed(seed)
     random.shuffle(l)
     random.setstate(rng_state)
+
+
+def roll_control_dropout_mode():
+    modes, weights = zip(*CONTROL_DROPOUT_MODES)
+    return random.choices(modes, weights=weights, k=1)[0]
 
 
 def shuffle_captions(captions: list[str], count: int = 0, delimiter: str = ', ', caption_prefix: str = '') -> list[str]:
@@ -144,7 +158,11 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         for i in range(length):
             result = {}
             for key in batch:
-                result[key] = batch[key][i]
+              if isinstance(batch[key], dict):
+                  # Unbatch each tensor inside the dictionary
+                  result[key] = {sub_k: sub_v[i] for sub_k, sub_v in batch[key].items()}
+              else:
+                  result[key] = batch[key][i]
             yield recursive_clone_tensors(result)
 
     completed_batches = cache_size // caching_batch_size
@@ -1026,12 +1044,28 @@ class Dataset:
             if key == 'mask':
                 continue  # mask is handled specially below
             features = [example[key] for example in examples]
-            if torch.is_tensor(features[0]):
+            if isinstance(features[0], dict):
+                dict_features = {}
+                for feature_key in features[0]:
+                    values = [feature[feature_key] for feature in features]
+                    if torch.is_tensor(values[0]):
+                        shape = values[0].shape
+                        if all(value.shape == shape for value in values):
+                            values = torch.stack(values)
+                    dict_features[feature_key] = values
+                features = dict_features
+            elif torch.is_tensor(features[0]):
                 shape = features[0].shape
                 if all(f.shape == shape for f in features):
                     # if we can form a single batched tensor, do it
                     features = torch.stack(features)
             ret[key] = features
+        if isinstance(ret.get('control_latents'), dict):
+            available_refs = set(ret['control_latents'])
+            active_refs = tuple(ref for ref in roll_control_dropout_mode() if ref in available_refs)
+            if len(active_refs) == 0:
+                active_refs = tuple(ret['control_latents'].keys())
+            ret['active_control_refs'] = active_refs
         # Only some items in the batch might have valid mask.
         masks = [example['mask'] for example in examples]
         # See if we have any valid masks. If we do, they should all have the same shape.
@@ -1128,7 +1162,13 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
                 results[k].append(v)
         # concatenate the list of tensors at each key into one batched tensor
         for k, v in results.items():
-            results[k] = torch.cat(v)
+            if isinstance(v[0], dict):
+                results[k] = {
+                    ref: torch.cat([item[ref] for item in v])
+                    for ref in v[0]
+                }
+            else:
+                results[k] = torch.cat(v)
         results['image_spec'] = image_specs
         results['mask'] = [t[1] for t in tensors_and_masks]
         results['caption'] = captions
@@ -1275,7 +1315,10 @@ class DatasetManager:
         # I think this is because HF Datasets uses the multiprocess library (different from Python multiprocessing!) so it will always use fork.
         cpu_results = {}
         for k, v in results.items():
-            if isinstance(v, (list, tuple)):
+            if isinstance(v, dict):
+                # Move each tensor inside the dictionary to CPU
+                cpu_results[k] = {ref_key: ref_tensor.to('cpu') for ref_key, ref_tensor in v.items()}
+            elif isinstance(v, (list, tuple)):
                 cpu_results[k] = [x.to('cpu') for x in v]
             else:
                 cpu_results[k] = v.to('cpu')
@@ -1287,7 +1330,12 @@ def split_batch(batch, pieces):
     features, label = batch
     split_size = features[0].size(0) // pieces
     # The tuples passed to Deepspeed need to only contain tensors. For None (e.g. mask, or optional conditioning), convert to empty tensor.
-    split_features = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in features))
+    split_features = zip(*(
+        torch.split(tensor, split_size) if torch.is_tensor(tensor)
+        else [torch.tensor([])]*pieces if tensor is None
+        else [tensor]*pieces
+        for tensor in features
+    ))
     split_label = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in label))
     # Deepspeed works with a tuple of (features, labels).
     return list(zip(split_features, split_label))
