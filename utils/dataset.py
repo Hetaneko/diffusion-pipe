@@ -36,25 +36,25 @@ ROUND_DECIMAL_DIGITS = 3
 
 UNCOND_FRACTION = 0.0
 
-# CONTROL_DROPOUT_MODES = [
-#     (("ref1", "ref2", "ref3"), 70),
-#     (("ref2", "ref3"),         10),
-#     (("ref1", "ref2"),          7),
-#     (("ref1", "ref3"),          6),
-#     (("ref1",),                 3),
-#     (("ref2",),                 3),
-#     (("ref3",),                 1),
-# ]
-
 CONTROL_DROPOUT_MODES = [
-    (("ref1", "ref2", "ref3"), 25),
-    (("ref2", "ref3"),         12),
-    (("ref1", "ref2"),          15),
-    (("ref1", "ref3"),          12),
-    (("ref1",),                 12),
-    (("ref2",),                 12),
-    (("ref3",),                 12),
+    (("ref1", "ref2", "ref3"), 70),
+    (("ref2", "ref3"),         10),
+    (("ref1", "ref2"),          7),
+    (("ref1", "ref3"),          6),
+    (("ref1",),                 3),
+    (("ref2",),                 3),
+    (("ref3",),                 1),
 ]
+
+# CONTROL_DROPOUT_MODES = [
+#     (("ref1", "ref2", "ref3"), 25),
+#     (("ref2", "ref3"),         12),
+#     (("ref1", "ref2"),          15),
+#     (("ref1", "ref3"),          12),
+#     (("ref1",),                 12),
+#     (("ref2",),                 12),
+#     (("ref3",),                 12),
+# ]
 
 
 def shuffle_with_seed(l, seed=None):
