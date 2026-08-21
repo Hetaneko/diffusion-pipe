@@ -313,9 +313,18 @@ class CosmosPredict2Pipeline(BasePipeline):
 
         self.transformer = transformer
         hidden_dim = dit_config['model_channels']
-        self.transformer.layout_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
-        self.transformer.character_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
-        self.transformer.background_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        if 'layout_tag' in state_dict:
+            self.transformer.layout_tag = nn.Parameter(state_dict['layout_tag'].to('cpu'))
+            self.transformer.character_tag = nn.Parameter(state_dict['character_tag'].to('cpu'))
+            self.transformer.background_tag = nn.Parameter(state_dict['background_tag'].to('cpu'))
+            print("Successfully loaded existing Layout/Character/Background tags from checkpoint!")
+        else:
+            self.transformer.layout_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            self.transformer.character_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            self.transformer.background_tag = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+            print("Initialized fresh Layout/Character/Background tags.")
+        # --------------------------------------------------------
+
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
             p.original_name = name
@@ -333,10 +342,24 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.peft_config.save_pretrained(save_dir)
         # ComfyUI format.
         peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
+        
+        # --- EXPLICITLY RESCUE OUR TAGS ---
+        peft_state_dict['diffusion_model.layout_tag'] = self.transformer.layout_tag.detach().cpu()
+        peft_state_dict['diffusion_model.character_tag'] = self.transformer.character_tag.detach().cpu()
+        peft_state_dict['diffusion_model.background_tag'] = self.transformer.background_tag.detach().cpu()
+        # ----------------------------------
+        
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def save_model(self, save_dir, state_dict):
         state_dict = {'net.'+k: v for k, v in state_dict.items()}
+        
+        # --- EXPLICITLY RESCUE OUR TAGS ---
+        state_dict['net.layout_tag'] = self.transformer.layout_tag.detach().cpu()
+        state_dict['net.character_tag'] = self.transformer.character_tag.detach().cpu()
+        state_dict['net.background_tag'] = self.transformer.background_tag.detach().cpu()
+        # ----------------------------------
+        
         safetensors.torch.save_file(state_dict, save_dir / 'model.safetensors', metadata={'format': 'pt'})
 
     def get_preprocess_media_file_fn(self):
